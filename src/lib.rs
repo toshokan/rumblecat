@@ -5,6 +5,7 @@ use tokio_rustls::client::TlsStream;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
+use futures::{SinkExt, stream::StreamExt};
 
 mod raw;
 
@@ -220,7 +221,9 @@ impl ControlChannel {
 }
 
 pub struct MumbleConnector {
-    tls_connector: tokio_rustls::TlsConnector
+    host: String,
+    port: u16,
+    tls_connector: tokio_rustls::TlsConnector,
 }
 
 struct NoCertVerify {}
@@ -235,27 +238,30 @@ impl rustls::ServerCertVerifier for NoCertVerify {
 }
 
 impl MumbleConnector {
-    pub fn new() -> Self {
+    pub fn new(host: String, port: u16) -> Self {
 	use tokio_rustls::TlsConnector;
 	
 	let mut config = rustls::ClientConfig::new();
 	config.dangerous()
 	    .set_certificate_verifier(Arc::new(NoCertVerify{}));
+
 	Self {
+	    host,
+	    port,
 	    tls_connector: TlsConnector::from(Arc::new(config))
 	}
     }
 
-    pub async fn connect(&self, user: &str, host: &str, port: u16) -> Option<MumbleClient> {
-	let channel = self.connect_stream(host, port).await?;
+    pub async fn connect(&self, user: &str) -> Option<MumbleClient> {
+	let channel = self.connect_stream().await?;
 	let client = Self::handshake(user, channel).await?;
 	Some(client)
     }
     
-    async fn connect_stream(&self, host: &str, port: u16) -> Option<ControlChannel> {
-	let stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
-	let host = webpki::DNSNameRef::try_from_ascii_str(host).unwrap();
-	let stream = self.tls_connector.connect(host, stream).await.ok()?;
+    async fn connect_stream(&self) -> Option<ControlChannel> {
+	let stream = tokio::net::TcpStream::connect((self.host.clone(), self.port)).await.ok()?;
+	let dns_host = webpki::DNSNameRef::try_from_ascii_str(&self.host).unwrap();
+	let stream = self.tls_connector.connect(dns_host, stream).await.ok()?;
 	let (r, w) = tokio::io::split(stream);
 	Some(ControlChannel {
 	    read: Mutex::new(r),
@@ -555,4 +561,35 @@ impl Target {
 	    i => Self::Whisper(i)
 	}
     }
+}
+
+pub async fn serve(connector: MumbleConnector) -> Option<()> {
+    use warp::Filter;
+
+    let connector = Arc::new(connector);
+    
+    let routes = warp::path("rumble")
+        .and(warp::any().map(move || connector.clone()))
+        .and(warp::path::param())
+        .and(warp::ws())
+        .map(|connector: Arc<MumbleConnector>, user: String, ws: warp::ws::Ws| {
+
+	    
+	    ws.on_upgrade(|socket| async move {
+		let (mut tx, mut rx) = socket.split();
+		let mut connection = connector.connect(&user).await.unwrap();		
+		let handle = tokio::task::spawn(async move {
+		    while let Some(msg) = connection.rx.recv().await {
+			tx.send(warp::ws::Message::text(format!("got message {:?} from mumble", msg.tag()))).await.unwrap();
+		    }
+		});
+		
+		while let Some(x) = rx.next().await {
+		    eprintln!("{:?}", x)
+		}
+	    })
+	});
+
+    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
+    Some(())
 }
