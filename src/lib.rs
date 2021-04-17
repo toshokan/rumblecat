@@ -1,4 +1,5 @@
 use rustls::ClientCertVerified;
+use serde::de::EnumAccess;
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf}, time};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::{client::TlsStream};
@@ -231,11 +232,123 @@ pub enum PacketKind {
 }
 
 impl PacketKind {
+    fn is_voice(&self) -> bool {
+	if let Self::UdpTunnel = self {
+	    true
+	} else {
+	    false
+	}
+    }
+    
     fn from_tag(tag: u16) -> Option<Self> {
 	if tag >= 0 && tag < 26 {
 	    unsafe { Some(std::mem::transmute(tag)) }
 	} else {
 	    None
+	}
+    }
+}
+
+enum VoicePacket<A> {
+    Ping {
+	timestamp: u64,
+    },
+    Audio(A)
+}
+
+impl VoicePacket<IncomingAudioPacket> {
+    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<Self> {
+	let header = r.read_u8().await.ok()?;
+	match (header >> 5) {
+	    0b000 => {
+		// celt
+		let target = Target::from_header_byte(header);
+	    },
+	    0b001 => {
+		//ping
+		
+	    },
+	    0b010 => {
+		// speex
+		let target = Target::from_header_byte(header);
+	    },
+	    0b011 => {
+		// opus
+		let target = Target::from_header_byte(header);
+	    },
+	    _ => ()
+	}
+	None
+    }
+}
+
+async fn varint<R: AsyncRead + Unpin>(r: &mut R) -> Option<u64> {
+    let byte = r.read_u8().await.ok()?;
+    if byte & 0b10000000 != 0 {
+	return Some(byte as u64)
+    } else if byte >> 6 == 0b10 {
+	// one more byte
+    } else if byte >> 5 == 0b110 {
+	// two more bytes
+    } else if byte >> 4 == 0b1110 {
+	// 3 more bytes
+    } else if byte >> 2 == 0b111100 {
+	let int = r.read_u32().await.ok()?;
+	return Some(int as u64)
+    } else if byte >> 2 == 0b111101 {
+	let long = r.read_u64().await.ok()?;
+	return Some(long)
+    } else if byte >> 2 == 0b111110 {
+	// hmm, this breaks the type...
+	// let v = variant(r).map(|i| i * -1)
+    } else if byte >> 2 == 0b111111 {
+	return Some(!(byte & 0b11) as u64)
+    }
+    None
+}
+
+impl VoicePacket<OutgoingAudioPacket> {
+    async fn write_to<W: AsyncWrite + Unpin>(w: &mut W) -> Option<()> {
+	None
+    }
+}
+
+struct IncomingAudioPacket {
+    target: Target,
+    kind: AudioPacketKind,
+    session_id: u64,
+    sequence_number: u64,
+    position_info: Option<(f32, f32, f32)>
+}
+
+struct OutgoingAudioPacket {
+    target: Target,
+    kind: AudioPacketKind,
+    sequence_number: u64,
+    position_info: Option<(f32, f32, f32)>
+}
+
+enum AudioPacketKind {
+    CeltAlpha(Vec<u8>),
+    CeltBeta(Vec<u8>),
+    Speex(Vec<u8>),
+    Opus(bool, Vec<u8>)
+}
+
+#[derive(Debug)]
+enum Target {
+    Normal,
+    Whisper(u8),
+    ServerLoopback
+}
+
+impl Target {
+    fn from_header_byte(byte: u8) -> Self {
+	let byte = byte & 0b11111;
+	match byte {
+	    0 => Self::Normal,
+	    31 => Self::ServerLoopback,
+	    i => Self::Whisper(i)
 	}
     }
 }
