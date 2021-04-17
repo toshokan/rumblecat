@@ -1,10 +1,15 @@
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use rustls::ClientCertVerified;
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf}, time};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::{client::TlsStream};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod raw;
 
 macro_rules! bind_message {
     (enum $name:ident {$($variant:ident ($field:ty) [$tag:path]),*}) => {
+	#[derive(Debug)]
 	pub enum $name {
 	    $(
 		$variant($field),
@@ -22,6 +27,7 @@ macro_rules! bind_message {
 
 	    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<$name> {
 		let tag = PacketKind::from_tag(r.read_u16().await.ok()?)?;
+		dbg!(&tag);
 		let len = r.read_u32().await.ok()?;
 		match tag {
 		    $(
@@ -35,13 +41,13 @@ macro_rules! bind_message {
 		}
 	    }
 
-	    async fn write_to<W: AsyncWrite + Unpin>(w: &mut W, m: $name) -> Option<()> {
+	    async fn write_to<W: AsyncWrite + Unpin>(self, w: &mut W) -> Option<()> {
 		use tokio::io::AsyncWriteExt;
 		use prost::Message;
 		
-		let tag = m.tag() as u16;
+		let tag = self.tag() as u16;
 		let mut buf = vec![];
-		match m {
+		match self {
 		    $(
 			Self::$variant(f) => {
 			    f.encode(&mut buf).ok()?
@@ -90,23 +96,111 @@ bind_message!{
 
 pub struct MumbleClient<H> {
     control: ControlChannel<H>,
-    voice: VoiceChannel,
+    voice: Option<VoiceChannel>,
 }
 
-struct ControlChannel<H> {
-    stream: TcpStream,
+impl<H: MessageHandler> MumbleClient<H> {
+    async fn send_message(&self, m: Message) -> Option<()> {
+	let mut writer = self.control.write_stream.lock().await;
+	m.write_to(&mut *writer).await
+    }
+
+    async fn recv_message(&self) -> Option<Message> {
+	let mut reader = self.control.read_steam.lock().await;
+	Message::read_from(&mut *reader).await
+    }
+
+    async fn ping_task(client: Arc<Self>) {
+	use std::time::Duration;
+	use tokio::time::interval;
+	let mut interval = interval(Duration::from_secs(15));
+	loop {
+	    interval.tick().await;
+	    client.send_message(Message::Ping(raw::Ping::default())).await;
+	}
+    }
+}
+
+pub struct ControlChannel<H> {
+    read_steam: Mutex<ReadHalf<TlsStream<TcpStream>>>,
+    write_stream: Mutex<WriteHalf<TlsStream<TcpStream>>>,
     handler: H
+}
+
+pub async fn connect<H: MessageHandler>(host: &str, port: u16, h: H) -> Option<Arc<MumbleClient<H>>>
+    where H: Send + Sync + 'static
+{
+    use tokio_rustls::TlsConnector;
+    use webpki::DNSNameRef;
+    
+    let stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
+    let mut config = rustls::ClientConfig::new();
+    config
+	.dangerous()
+	.set_certificate_verifier(Arc::new(NoCertVerify{}));
+    let config = TlsConnector::from(Arc::new(config));
+    let host = DNSNameRef::try_from_ascii_str(host).unwrap();
+    let stream = config.connect(host, stream).await.ok()?;
+    let (r,w) = tokio::io::split(stream);
+    let channel = ControlChannel {
+	read_steam: Mutex::new(r),
+	write_stream: Mutex::new(w),
+	handler: h
+    };
+    let client = Arc::new(MumbleClient {
+	control: channel,
+	voice: None
+    });
+    let v = if let Message::Version(v) = client.recv_message().await? {
+	v
+    } else {
+	unimplemented!();
+    };
+    eprintln!("GOT VERSION - OK!");
+    let my_version = Message::Version(raw::Version {
+        version: v.version,
+        release: Some("1.3.3".to_string()),
+        os: Some("gnu/linux".to_string()),
+        os_version: None,
+    });
+    client.send_message(my_version).await?;
+    let my_auth = Message::Authenticate(raw::Authenticate {
+	username: Some("rumblecat".to_string()),
+	password: None,
+	tokens: vec![],
+	opus: Some(true),
+	celt_versions: vec![]
+    });
+    eprintln!("SENT VERSION - OK!");
+    client.send_message(my_auth).await?;
+    eprintln!("SENT AUTH - OK!");
+    if let Message::CryptSetup(cs) = client.recv_message().await? {
+	eprintln!("GOT CRYPTO - OK! {:?}", cs);
+    }
+    let ping_handle = tokio::task::spawn(MumbleClient::ping_task(Arc::clone(&client)));
+    while let Some(msg) = client.recv_message().await {
+	eprintln!("GOT MSG = {:?}", msg.tag());
+    }
+    Some(client)
+}
+
+struct NoCertVerify {}
+impl rustls::ServerCertVerifier for NoCertVerify {
+    fn verify_server_cert(&self, _: &rustls::RootCertStore, _: &[rustls::Certificate], _: webpki::DNSNameRef, _: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
+	Ok(rustls::ServerCertVerified::assertion())
+    }
 }
 
 struct VoiceChannel(UdpSocket);
 
 #[async_trait::async_trait]
-trait MessageHandler {
-    async fn handle_message(m: Message);
+pub trait MessageHandler {
+    async fn handle_message(m: Message) {}
 }
 
 #[repr(u16)]
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum PacketKind {
     Version = 0,
     UdpTunnel = 1,
@@ -138,7 +232,7 @@ pub enum PacketKind {
 
 impl PacketKind {
     fn from_tag(tag: u16) -> Option<Self> {
-	if tag > 0 && tag < 26 {
+	if tag >= 0 && tag < 26 {
 	    unsafe { Some(std::mem::transmute(tag)) }
 	} else {
 	    None
