@@ -288,10 +288,16 @@ async fn varint<R: AsyncRead + Unpin>(r: &mut R) -> Option<u64> {
 	return Some(byte as u64)
     } else if byte >> 6 == 0b10 {
 	// one more byte
+	let rest = r.read_u8().await.ok()?;
+	return Some(((byte << 8) | rest) as u64)
     } else if byte >> 5 == 0b110 {
 	// two more bytes
+	let rest = r.read_u16().await.ok()?;
+	return Some(((byte << 16) as u16 | rest) as u64)
     } else if byte >> 4 == 0b1110 {
 	// 3 more bytes
+	let rest = r.read_u32().await.ok()?;
+	return Some(((byte << 32) as u32 | rest) as u64)
     } else if byte >> 2 == 0b111100 {
 	let int = r.read_u32().await.ok()?;
 	return Some(int as u64)
