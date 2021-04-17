@@ -241,7 +241,7 @@ impl PacketKind {
     }
     
     fn from_tag(tag: u16) -> Option<Self> {
-	if tag >= 0 && tag < 26 {
+	if tag < 26 {
 	    unsafe { Some(std::mem::transmute(tag)) }
 	} else {
 	    None
@@ -249,6 +249,7 @@ impl PacketKind {
     }
 }
 
+#[derive(Debug)]
 enum VoicePacket<A> {
     Ping {
 	timestamp: u64,
@@ -258,27 +259,94 @@ enum VoicePacket<A> {
 
 impl VoicePacket<IncomingAudioPacket> {
     async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<Self> {
+	macro_rules! read_f32 {
+	    () => {{
+		let b1 = r.read_u8().await.ok()?;
+		let b2 = r.read_u8().await.ok()?;
+		let b3 = r.read_u8().await.ok()?;
+		let b4 = r.read_u8().await.ok()?;
+		f32::from_be_bytes([b1, b2, b3, b4])
+	    }}
+	}
+	macro_rules! read_pos {
+	    () => {{
+		let x = read_f32!();
+		let y = read_f32!();
+		let z = read_f32!();
+		(x, y, z)
+	    }}
+	}
 	let header = r.read_u8().await.ok()?;
-	match (header >> 5) {
+	match header >> 5 {
 	    0b000 => {
-		// celt
+		// celt alpha
 		let target = Target::from_header_byte(header);
+		let session_id = varint(r).await?;
+		let sequence_number = varint(r).await?;
+		let data = read_speex_or_celt_payload(r).await?;
+		let position = read_pos!();
+		Some(VoicePacket::Audio(IncomingAudioPacket {
+		    target,
+		    kind: AudioPacketKind::CeltAlpha(data),
+		    session_id,
+		    sequence_number,
+		    position_info: Some(position)
+		}))
 	    },
 	    0b001 => {
 		//ping
-		
+		let timestamp = varint(r).await?;
+		Some(VoicePacket::Ping {
+		    timestamp
+		})
 	    },
 	    0b010 => {
 		// speex
 		let target = Target::from_header_byte(header);
+		let session_id = varint(r).await?;
+		let sequence_number = varint(r).await?;
+		let data = read_speex_or_celt_payload(r).await?;
+		let position = read_pos!();
+		Some(VoicePacket::Audio(IncomingAudioPacket {
+		    target,
+		    kind: AudioPacketKind::Speex(data),
+		    session_id,
+		    sequence_number,
+		    position_info: Some(position)
+		}))
 	    },
 	    0b011 => {
+		// celt beta
+		let target = Target::from_header_byte(header);
+		let session_id = varint(r).await?;
+		let sequence_number = varint(r).await?;
+		let data = read_speex_or_celt_payload(r).await?;
+		let position = read_pos!();
+		Some(VoicePacket::Audio(IncomingAudioPacket {
+		    target,
+		    kind: AudioPacketKind::CeltBeta(data),
+		    session_id,
+		    sequence_number,
+		    position_info: Some(position)
+		}))
+	    },
+	    0b100 => {
 		// opus
 		let target = Target::from_header_byte(header);
+		let session_id = varint(r).await?;
+		let sequence_number = varint(r).await?;
+		let data = read_opus_payload(r).await?;
+		let position = read_pos!();
+		Some(VoicePacket::Audio(IncomingAudioPacket {
+		    target,
+		    kind: AudioPacketKind::Opus(data),
+		    session_id,
+		    sequence_number,
+		    position_info: Some(position)
+		}))
 	    },
-	    _ => ()
+	    _ => None
 	}
-	None
     }
 }
 
@@ -313,12 +381,37 @@ async fn varint<R: AsyncRead + Unpin>(r: &mut R) -> Option<u64> {
     None
 }
 
+async fn read_speex_or_celt_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
+    let mut buf = vec![];
+    loop {
+	let header = r.read_u8().await.ok()?;
+	let len = header & 0b01111111;
+	if len == 0 || header & 0b10000000 != 0 {
+	    break;
+	}
+	let mut buf2 = vec![0u8; len as usize];
+	r.read_exact(&mut buf2).await.ok()?;
+	buf.append(&mut buf2);
+    }
+    Some(buf)
+}
+
+async fn read_opus_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
+    let header = varint(r).await?;
+    let is_last = header & 0x2000 != 0;
+    let len = header & 0x1FFF;
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf).await.ok()?;
+    Some(buf)
+}
+
 impl VoicePacket<OutgoingAudioPacket> {
     async fn write_to<W: AsyncWrite + Unpin>(w: &mut W) -> Option<()> {
 	None
     }
 }
 
+#[derive(Debug)]
 struct IncomingAudioPacket {
     target: Target,
     kind: AudioPacketKind,
@@ -334,11 +427,12 @@ struct OutgoingAudioPacket {
     position_info: Option<(f32, f32, f32)>
 }
 
+#[derive(Debug)]
 enum AudioPacketKind {
     CeltAlpha(Vec<u8>),
     CeltBeta(Vec<u8>),
     Speex(Vec<u8>),
-    Opus(bool, Vec<u8>)
+    Opus(Vec<u8>)
 }
 
 #[derive(Debug)]
