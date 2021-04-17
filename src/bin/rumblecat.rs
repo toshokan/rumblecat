@@ -6,9 +6,11 @@ async fn main() {
     dotenv().ok();
     let host = env::var("RUMBLECAT_HOST").unwrap();
     let port: u16 = str::parse(&env::var("RUMBLECAT_PORT").unwrap()).unwrap();
-    
-    struct NoOp;
-    impl rumblecat::MessageHandler for NoOp {}
-    
-    rumblecat::connect(&host, port, NoOp{}).await.unwrap();
+
+    let connector = rumblecat::MumbleConnector::new();
+    let mut connection = connector.connect("rumblecat", &host, port).await.unwrap();
+    while let Some(msg) = connection.rx.recv().await {
+	dbg!(msg);
+    }
+    std::thread::park()
 }

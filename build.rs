@@ -1,4 +1,8 @@
 fn main() -> std::io::Result<()> {
-    prost_build::compile_protos(&["src/Mumble.proto"], &["src/"])?;
+    use prost_build::Config;
+
+    let mut cfg = Config::new();
+    cfg.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    cfg.compile_protos(&["src/Mumble.proto"], &["src/"])?;
     Ok(())
 }

@@ -1,34 +1,50 @@
-use rustls::ClientCertVerified;
-use serde::de::EnumAccess;
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf}, time};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio_rustls::{client::TlsStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
+use tokio_rustls::client::TlsStream;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
 
 mod raw;
 
 macro_rules! bind_message {
-    (enum $name:ident {$($variant:ident ($field:ty) [$tag:path]),*}) => {
+    (enum ($iname:ident, $oname:ident) {$($variant:ident ($field:ty) [$tag:path]),* | $($vvariant:ident ($vfield:ty, $vfield2:ty) [$vtag:path]),*}) => {
 	#[derive(Debug)]
-	pub enum $name {
+	pub enum $iname {
 	    $(
 		$variant($field),
 	    )*
+	    $(
+		$vvariant($vfield),
+	    )*
 	}
 
-	impl $name {
+	#[derive(Debug)]
+	pub enum $oname {
+	    $(
+		$variant($field),
+	    )*
+	    $(
+	        $vvariant($vfield2),
+	    )*
+	}
+
+	impl $iname {
 	    fn tag(&self) -> PacketKind {
 		match &self {
 		    $(
-			Self::$variant(_) => $tag
-		    ),*
+			Self::$variant(_) => $tag,
+		    )*
+		    $(
+		        Self::$vvariant(_) => $vtag,
+		    )*
 		}
 	    }
 
-	    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<$name> {
-		let tag = PacketKind::from_tag(r.read_u16().await.ok()?)?;
-		dbg!(&tag);
+	    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<$iname> {
+		let tag_bytes = r.read_u16().await.ok()?;
+		let tag = PacketKind::from_tag(tag_bytes)?;
 		let len = r.read_u32().await.ok()?;
 		match tag {
 		    $(
@@ -38,10 +54,29 @@ macro_rules! bind_message {
 			    let variant = <$field as prost::Message>::decode(buf.as_slice()).ok()?;
 			    Some(Self::$variant(variant))
 			}
+		    ),*,
+		    $(
+			$vtag => {
+			    let pkt = <$vfield>::read_from(r).await?;
+			    Some(Self::$vvariant(pkt))
+			}
 		    ),*
 		}
 	    }
+	}
 
+	impl $oname {
+	    fn tag(&self) -> PacketKind {
+		match &self {
+		    $(
+			Self::$variant(_) => $tag,
+		    )*
+		    $(
+		        Self::$vvariant(_) => $vtag,
+		    )*
+		}
+	    }
+	    
 	    async fn write_to<W: AsyncWrite + Unpin>(self, w: &mut W) -> Option<()> {
 		use tokio::io::AsyncWriteExt;
 		use prost::Message;
@@ -54,6 +89,11 @@ macro_rules! bind_message {
 			    f.encode(&mut buf).ok()?
 			}
 		    ),*
+		    $(
+		        Self::$vvariant(_) => {
+		    	    unimplemented!()
+		        }
+		    ),*
 		}
 		w.write_all(&tag.to_be_bytes()).await.ok()?;
 		w.write_all(&(buf.len() as u32).to_be_bytes()).await.ok()?;
@@ -64,10 +104,9 @@ macro_rules! bind_message {
     };
 }
 
-bind_message!{
-    enum Message {
+bind_message! {
+    enum (IncomingMessage, OutgoingMessage) {
 	Version(raw::Version) [PacketKind::Version],
-	UdpTunnel(raw::UdpTunnel) [PacketKind::UdpTunnel],
 	Authenticate(raw::Authenticate) [PacketKind::Authenticate],
 	Ping(raw::Ping) [PacketKind::Ping],
 	Reject(raw::Reject) [PacketKind::Reject],
@@ -92,111 +131,180 @@ bind_message!{
 	RequestBlob(raw::RequestBlob) [PacketKind::RequestBlob],
 	ServerConfig(raw::ServerConfig) [PacketKind::ServerConfig],
 	SuggestConfig(raw::SuggestConfig) [PacketKind::SuggestConfig]
+	    |
+	UdpTunnel(VoicePacket<IncomingAudioPacket>, VoicePacket<OutgoingAudioPacket>) [PacketKind::UdpTunnel]
     }
 }
 
-pub struct MumbleClient<H> {
-    control: ControlChannel<H>,
-    voice: Option<VoiceChannel>,
+pub struct MumbleClient {
+    control: Arc<ControlChannel>,
+    tasks: MaintenanceTasks,
+    pub rx: UnboundedReceiver<IncomingMessage>,
+    tx: UnboundedSender<OutgoingMessage>
 }
 
-impl<H: MessageHandler> MumbleClient<H> {
-    async fn send_message(&self, m: Message) -> Option<()> {
-	let mut writer = self.control.write_stream.lock().await;
-	m.write_to(&mut *writer).await
-    }
+pub struct MaintenanceTasks {
+    ping: JoinHandle<()>,
+    send: JoinHandle<()>,
+    recv: JoinHandle<()>
+}
 
-    async fn recv_message(&self) -> Option<Message> {
-	let mut reader = self.control.read_steam.lock().await;
-	Message::read_from(&mut *reader).await
-    }
-
-    async fn ping_task(client: Arc<Self>) {
+impl MaintenanceTasks {
+    async fn ping_task(control: Arc<ControlChannel>) {
 	use std::time::Duration;
 	use tokio::time::interval;
+	
 	let mut interval = interval(Duration::from_secs(15));
 	loop {
 	    interval.tick().await;
-	    client.send_message(Message::Ping(raw::Ping::default())).await;
+	    control.send_message(OutgoingMessage::Ping(raw::Ping::default())).await;
 	}
     }
-}
 
-pub struct ControlChannel<H> {
-    read_steam: Mutex<ReadHalf<TlsStream<TcpStream>>>,
-    write_stream: Mutex<WriteHalf<TlsStream<TcpStream>>>,
-    handler: H
-}
+    fn send_task(control: Arc<ControlChannel>) -> (JoinHandle<()>, UnboundedSender<OutgoingMessage>) {
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let handle = tokio::task::spawn(async move {
+	    while let Some(msg) = rx.recv().await {
+		control.send_message(msg).await.unwrap()
+	    }
+	});
+	(handle, tx)
+    }
 
-pub async fn connect<H: MessageHandler>(host: &str, port: u16, h: H) -> Option<Arc<MumbleClient<H>>>
-    where H: Send + Sync + 'static
-{
-    use tokio_rustls::TlsConnector;
-    use webpki::DNSNameRef;
+    fn recv_task(control: Arc<ControlChannel>) -> (JoinHandle<()>, UnboundedReceiver<IncomingMessage>) {
+	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+	let handle = tokio::task::spawn(async move {
+	    while let Some(msg) = control.recv_message().await {
+		tx.send(msg);
+	    }
+	});
+	(handle, rx)
+    }
     
-    let stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
-    let mut config = rustls::ClientConfig::new();
-    config
-	.dangerous()
-	.set_certificate_verifier(Arc::new(NoCertVerify{}));
-    let config = TlsConnector::from(Arc::new(config));
-    let host = DNSNameRef::try_from_ascii_str(host).unwrap();
-    let stream = config.connect(host, stream).await.ok()?;
-    let (r,w) = tokio::io::split(stream);
-    let channel = ControlChannel {
-	read_steam: Mutex::new(r),
-	write_stream: Mutex::new(w),
-	handler: h
-    };
-    let client = Arc::new(MumbleClient {
-	control: channel,
-	voice: None
-    });
-    let v = if let Message::Version(v) = client.recv_message().await? {
-	v
-    } else {
-	unimplemented!();
-    };
-    eprintln!("GOT VERSION - OK!");
-    let my_version = Message::Version(raw::Version {
-        version: v.version,
-        release: Some("1.3.3".to_string()),
-        os: Some("gnu/linux".to_string()),
-        os_version: None,
-    });
-    client.send_message(my_version).await?;
-    let my_auth = Message::Authenticate(raw::Authenticate {
-	username: Some("rumblecat".to_string()),
-	password: None,
-	tokens: vec![],
-	opus: Some(true),
-	celt_versions: vec![]
-    });
-    eprintln!("SENT VERSION - OK!");
-    client.send_message(my_auth).await?;
-    eprintln!("SENT AUTH - OK!");
-    if let Message::CryptSetup(cs) = client.recv_message().await? {
-	eprintln!("GOT CRYPTO - OK! {:?}", cs);
+    fn start(control: Arc<ControlChannel>) -> (Self, UnboundedSender<OutgoingMessage>, UnboundedReceiver<IncomingMessage>) {
+	let (send, tx) = Self::send_task(Arc::clone(&control));
+	let (recv, rx) = Self::recv_task(Arc::clone(&control));
+	(Self {
+	    ping: tokio::task::spawn(Self::ping_task(control)),
+	    send,
+	    recv
+	}, tx, rx)
     }
-    let ping_handle = tokio::task::spawn(MumbleClient::ping_task(Arc::clone(&client)));
-    while let Some(msg) = client.recv_message().await {
-	eprintln!("GOT MSG = {:?}", msg.tag());
+}
+
+impl MumbleClient {
+    async fn send_message(&self, m: OutgoingMessage) -> Option<()> {
+	self.control.send_message(m).await
     }
-    Some(client)
+
+    async fn recv_message(&self) -> Option<IncomingMessage> {
+	self.control.recv_message().await
+    }
+}
+
+pub struct ControlChannel {
+    read: Mutex<ReadHalf<TlsStream<TcpStream>>>,
+    write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
+}
+
+impl ControlChannel {
+    async fn send_message(&self, m: OutgoingMessage) -> Option<()> {
+	let mut writer = self.write.lock().await;
+	m.write_to(&mut *writer).await
+    }
+
+    async fn recv_message(&self) -> Option<IncomingMessage> {
+	let mut reader = self.read.lock().await;
+	IncomingMessage::read_from(&mut *reader).await
+    }
+}
+
+pub struct MumbleConnector {
+    tls_connector: tokio_rustls::TlsConnector
 }
 
 struct NoCertVerify {}
 impl rustls::ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(&self, _: &rustls::RootCertStore, _: &[rustls::Certificate], _: webpki::DNSNameRef, _: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
+    fn verify_server_cert(&self,
+			  _: &rustls::RootCertStore,
+			  _: &[rustls::Certificate],
+			  _: webpki::DNSNameRef,
+			  _: &[u8]) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
 	Ok(rustls::ServerCertVerified::assertion())
     }
 }
 
-struct VoiceChannel(UdpSocket);
+impl MumbleConnector {
+    pub fn new() -> Self {
+	use tokio_rustls::TlsConnector;
+	
+	let mut config = rustls::ClientConfig::new();
+	config.dangerous()
+	    .set_certificate_verifier(Arc::new(NoCertVerify{}));
+	Self {
+	    tls_connector: TlsConnector::from(Arc::new(config))
+	}
+    }
+
+    pub async fn connect(&self, user: &str, host: &str, port: u16) -> Option<MumbleClient> {
+	let channel = self.connect_stream(host, port).await?;
+	let client = Self::handshake(user, channel).await?;
+	Some(client)
+    }
+    
+    async fn connect_stream(&self, host: &str, port: u16) -> Option<ControlChannel> {
+	let stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
+	let host = webpki::DNSNameRef::try_from_ascii_str(host).unwrap();
+	let stream = self.tls_connector.connect(host, stream).await.ok()?;
+	let (r, w) = tokio::io::split(stream);
+	Some(ControlChannel {
+	    read: Mutex::new(r),
+	    write: Mutex::new(w)
+	})
+    }
+
+    fn my_version(server_version: Option<u32>) -> OutgoingMessage {
+	OutgoingMessage::Version(raw::Version {
+	    version: server_version,
+	    os: Some("GNU/Linux".to_string()),
+	    ..Default::default()
+	})
+    }
+
+    async fn handshake(user: &str, channel: ControlChannel) -> Option<MumbleClient> {
+	let server_version = match channel.recv_message().await? {
+	    IncomingMessage::Version(v) => v,
+	    _ => unimplemented!()
+	};
+	channel.send_message(Self::my_version(server_version.version)).await?;
+	
+	let auth = OutgoingMessage::Authenticate(raw::Authenticate {
+	    username: Some(user.to_string()),
+	    opus: Some(true),
+	    ..Default::default()
+	});
+	channel.send_message(auth).await?;
+
+	if let IncomingMessage::CryptSetup(_) = channel.recv_message().await? {
+	    // ignore
+	}
+
+	let channel = Arc::new(channel);
+
+	let (tasks, tx, rx) = MaintenanceTasks::start(Arc::clone(&channel));
+
+	Some(MumbleClient {
+	    control: channel,
+	    tasks,
+	    rx,
+	    tx
+	})
+    }
+}
 
 #[async_trait::async_trait]
 pub trait MessageHandler {
-    async fn handle_message(m: Message) {}
+    async fn handle_message(m: IncomingMessage) {}
 }
 
 #[repr(u16)]
@@ -250,7 +358,7 @@ impl PacketKind {
 }
 
 #[derive(Debug)]
-enum VoicePacket<A> {
+pub enum VoicePacket<A> {
     Ping {
 	timestamp: u64,
     },
@@ -259,23 +367,6 @@ enum VoicePacket<A> {
 
 impl VoicePacket<IncomingAudioPacket> {
     async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<Self> {
-	macro_rules! read_f32 {
-	    () => {{
-		let b1 = r.read_u8().await.ok()?;
-		let b2 = r.read_u8().await.ok()?;
-		let b3 = r.read_u8().await.ok()?;
-		let b4 = r.read_u8().await.ok()?;
-		f32::from_be_bytes([b1, b2, b3, b4])
-	    }}
-	}
-	macro_rules! read_pos {
-	    () => {{
-		let x = read_f32!();
-		let y = read_f32!();
-		let z = read_f32!();
-		(x, y, z)
-	    }}
-	}
 	let header = r.read_u8().await.ok()?;
 	match header >> 5 {
 	    0b000 => {
@@ -284,13 +375,11 @@ impl VoicePacket<IncomingAudioPacket> {
 		let session_id = varint(r).await?;
 		let sequence_number = varint(r).await?;
 		let data = read_speex_or_celt_payload(r).await?;
-		let position = read_pos!();
 		Some(VoicePacket::Audio(IncomingAudioPacket {
 		    target,
 		    kind: AudioPacketKind::CeltAlpha(data),
 		    session_id,
 		    sequence_number,
-		    position_info: Some(position)
 		}))
 	    },
 	    0b001 => {
@@ -306,13 +395,11 @@ impl VoicePacket<IncomingAudioPacket> {
 		let session_id = varint(r).await?;
 		let sequence_number = varint(r).await?;
 		let data = read_speex_or_celt_payload(r).await?;
-		let position = read_pos!();
 		Some(VoicePacket::Audio(IncomingAudioPacket {
 		    target,
 		    kind: AudioPacketKind::Speex(data),
 		    session_id,
 		    sequence_number,
-		    position_info: Some(position)
 		}))
 	    },
 	    0b011 => {
@@ -321,13 +408,11 @@ impl VoicePacket<IncomingAudioPacket> {
 		let session_id = varint(r).await?;
 		let sequence_number = varint(r).await?;
 		let data = read_speex_or_celt_payload(r).await?;
-		let position = read_pos!();
 		Some(VoicePacket::Audio(IncomingAudioPacket {
 		    target,
 		    kind: AudioPacketKind::CeltBeta(data),
 		    session_id,
 		    sequence_number,
-		    position_info: Some(position)
 		}))
 	    },
 	    0b100 => {
@@ -336,13 +421,11 @@ impl VoicePacket<IncomingAudioPacket> {
 		let session_id = varint(r).await?;
 		let sequence_number = varint(r).await?;
 		let data = read_opus_payload(r).await?;
-		let position = read_pos!();
 		Some(VoicePacket::Audio(IncomingAudioPacket {
 		    target,
 		    kind: AudioPacketKind::Opus(data),
 		    session_id,
 		    sequence_number,
-		    position_info: Some(position)
 		}))
 	    },
 	    _ => None
@@ -352,20 +435,23 @@ impl VoicePacket<IncomingAudioPacket> {
 
 async fn varint<R: AsyncRead + Unpin>(r: &mut R) -> Option<u64> {
     let byte = r.read_u8().await.ok()?;
-    if byte & 0b10000000 != 0 {
+    if byte & 0b10000000 == 0 {
 	return Some(byte as u64)
     } else if byte >> 6 == 0b10 {
 	// one more byte
-	let rest = r.read_u8().await.ok()?;
+	let byte = (byte & 0b111111) as u64;
+	let rest = r.read_u8().await.ok()? as u64;
 	return Some(((byte << 8) | rest) as u64)
     } else if byte >> 5 == 0b110 {
 	// two more bytes
-	let rest = r.read_u16().await.ok()?;
-	return Some(((byte << 16) as u16 | rest) as u64)
+	let byte = (byte & 0b11111) as u64;
+	let rest = r.read_u16().await.ok()? as u64;
+	return Some(((byte << 16) | rest) as u64)
     } else if byte >> 4 == 0b1110 {
 	// 3 more bytes
-	let rest = r.read_u32().await.ok()?;
-	return Some(((byte << 32) as u32 | rest) as u64)
+	let byte = (byte & 0b1111) as u64;
+	let rest = r.read_u32().await.ok()? as u64;
+	return Some(((byte << 32) | rest) as u64)
     } else if byte >> 2 == 0b111100 {
 	let int = r.read_u32().await.ok()?;
 	return Some(int as u64)
@@ -378,31 +464,44 @@ async fn varint<R: AsyncRead + Unpin>(r: &mut R) -> Option<u64> {
     } else if byte >> 2 == 0b111111 {
 	return Some(!(byte & 0b11) as u64)
     }
-    None
+    unimplemented!()
 }
 
-async fn read_speex_or_celt_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
-    let mut buf = vec![];
+async fn read_speex_or_celt_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<AudioFrame>> {
+    let mut frames = vec![];
     loop {
 	let header = r.read_u8().await.ok()?;
 	let len = header & 0b01111111;
-	if len == 0 || header & 0b10000000 != 0 {
+	if len == 0 {
 	    break;
 	}
 	let mut buf2 = vec![0u8; len as usize];
 	r.read_exact(&mut buf2).await.ok()?;
-	buf.append(&mut buf2);
+	if header & 0b10000000 != 0 {
+	    frames.push(AudioFrame {
+		is_terminal: true,
+		data: buf2
+	    });
+	    break;
+	}
+	frames.push(AudioFrame {
+	    is_terminal: false,
+	    data: buf2
+	});
     }
-    Some(buf)
+    Some(frames)
 }
 
-async fn read_opus_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
+async fn read_opus_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<AudioFrame> {
     let header = varint(r).await?;
-    let is_last = header & 0x2000 != 0;
+    let is_terminal = header & 0x2000 != 0;
     let len = header & 0x1FFF;
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await.ok()?;
-    Some(buf)
+    let mut data = vec![0u8; len as usize];
+    r.read_exact(&mut data).await.ok()?;
+    Some(AudioFrame {
+	is_terminal,
+	data
+    })
 }
 
 impl VoicePacket<OutgoingAudioPacket> {
@@ -412,31 +511,36 @@ impl VoicePacket<OutgoingAudioPacket> {
 }
 
 #[derive(Debug)]
-struct IncomingAudioPacket {
+pub struct IncomingAudioPacket {
     target: Target,
     kind: AudioPacketKind,
     session_id: u64,
     sequence_number: u64,
-    position_info: Option<(f32, f32, f32)>
 }
 
-struct OutgoingAudioPacket {
+#[derive(Debug)]
+pub struct OutgoingAudioPacket {
     target: Target,
     kind: AudioPacketKind,
     sequence_number: u64,
-    position_info: Option<(f32, f32, f32)>
 }
 
 #[derive(Debug)]
-enum AudioPacketKind {
-    CeltAlpha(Vec<u8>),
-    CeltBeta(Vec<u8>),
-    Speex(Vec<u8>),
-    Opus(Vec<u8>)
+pub enum AudioPacketKind {
+    CeltAlpha(Vec<AudioFrame>),
+    CeltBeta(Vec<AudioFrame>),
+    Speex(Vec<AudioFrame>),
+    Opus(AudioFrame)
 }
 
 #[derive(Debug)]
-enum Target {
+pub struct AudioFrame {
+    is_terminal: bool,
+    data: Vec<u8>
+}
+
+#[derive(Debug)]
+pub enum Target {
     Normal,
     Whisper(u8),
     ServerLoopback
