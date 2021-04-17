@@ -138,16 +138,16 @@ bind_message! {
 }
 
 pub struct MumbleClient {
-    control: Arc<ControlChannel>,
-    tasks: MaintenanceTasks,
-    pub rx: UnboundedReceiver<IncomingMessage>,
+    _control: Arc<ControlChannel>,
+    _tasks: MaintenanceTasks,
+    rx: UnboundedReceiver<IncomingMessage>,
     tx: UnboundedSender<OutgoingMessage>
 }
 
 pub struct MaintenanceTasks {
-    ping: JoinHandle<()>,
-    send: JoinHandle<()>,
-    recv: JoinHandle<()>
+    _ping: JoinHandle<()>,
+    _send: JoinHandle<()>,
+    _recv: JoinHandle<()>
 }
 
 impl MaintenanceTasks {
@@ -176,7 +176,7 @@ impl MaintenanceTasks {
 	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 	let handle = tokio::task::spawn(async move {
 	    while let Some(msg) = control.recv_message().await {
-		tx.send(msg);
+		tx.send(msg).unwrap();
 	    }
 	});
 	(handle, rx)
@@ -186,20 +186,20 @@ impl MaintenanceTasks {
 	let (send, tx) = Self::send_task(Arc::clone(&control));
 	let (recv, rx) = Self::recv_task(Arc::clone(&control));
 	(Self {
-	    ping: tokio::task::spawn(Self::ping_task(control)),
-	    send,
-	    recv
+	    _ping: tokio::task::spawn(Self::ping_task(control)),
+	    _send: send,
+	    _recv: recv
 	}, tx, rx)
     }
 }
 
 impl MumbleClient {
-    async fn send_message(&self, m: OutgoingMessage) -> Option<()> {
-	self.control.send_message(m).await
+    pub async fn send_message(&self, m: OutgoingMessage) -> Option<()> {
+	self.tx.send(m).ok()
     }
 
-    async fn recv_message(&self) -> Option<IncomingMessage> {
-	self.control.recv_message().await
+    pub async fn recv_message(&mut self) -> Option<IncomingMessage> {
+	self.rx.recv().await
     }
 }
 
@@ -300,8 +300,8 @@ impl MumbleConnector {
 	let (tasks, tx, rx) = MaintenanceTasks::start(Arc::clone(&channel));
 
 	Some(MumbleClient {
-	    control: channel,
-	    tasks,
+	    _control: channel,
+	    _tasks: tasks,
 	    rx,
 	    tx
 	})
@@ -310,7 +310,7 @@ impl MumbleConnector {
 
 #[async_trait::async_trait]
 pub trait MessageHandler {
-    async fn handle_message(m: IncomingMessage) {}
+    async fn handle_message(_m: IncomingMessage) {}
 }
 
 #[repr(u16)]
@@ -346,14 +346,6 @@ pub enum PacketKind {
 }
 
 impl PacketKind {
-    fn is_voice(&self) -> bool {
-	if let Self::UdpTunnel = self {
-	    true
-	} else {
-	    false
-	}
-    }
-    
     fn from_tag(tag: u16) -> Option<Self> {
 	if tag < 26 {
 	    unsafe { Some(std::mem::transmute(tag)) }
@@ -510,11 +502,11 @@ async fn read_opus_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<AudioFrame
     })
 }
 
-impl VoicePacket<OutgoingAudioPacket> {
-    async fn write_to<W: AsyncWrite + Unpin>(w: &mut W) -> Option<()> {
-	None
-    }
-}
+// impl VoicePacket<OutgoingAudioPacket> {
+//     async fn write_to<W: AsyncWrite + Unpin>(_w: &mut W) -> Option<()> {
+// 	None
+//     }
+// }
 
 #[derive(Debug)]
 pub struct IncomingAudioPacket {
@@ -578,8 +570,8 @@ pub async fn serve(connector: MumbleConnector) -> Option<()> {
 	    ws.on_upgrade(|socket| async move {
 		let (mut tx, mut rx) = socket.split();
 		let mut connection = connector.connect(&user).await.unwrap();		
-		let handle = tokio::task::spawn(async move {
-		    while let Some(msg) = connection.rx.recv().await {
+		let _handle = tokio::task::spawn(async move {
+		    while let Some(msg) = connection.recv_message().await {
 			tx.send(warp::ws::Message::text(format!("got message {:?} from mumble", msg.tag()))).await.unwrap();
 		    }
 		});
