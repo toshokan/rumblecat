@@ -1,116 +1,109 @@
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
-use std::sync::Arc;
 
 mod raw;
 
-pub struct MumbleClient {
-    control: ControlChannel,
+macro_rules! bind_message {
+    (enum $name:ident {$($variant:ident ($field:ty) [$tag:path]),*}) => {
+	pub enum $name {
+	    $(
+		$variant($field),
+	    )*
+	}
+
+	impl $name {
+	    fn tag(&self) -> PacketKind {
+		match &self {
+		    $(
+			Self::$variant(_) => $tag
+		    ),*
+		}
+	    }
+
+	    async fn read_from<R: AsyncRead + Unpin>(r: &mut R) -> Option<$name> {
+		let tag = PacketKind::from_tag(r.read_u16().await.ok()?)?;
+		let len = r.read_u32().await.ok()?;
+		match tag {
+		    $(
+			$tag => {
+			    let mut buf = vec![0u8; len as usize];
+			    r.read_exact(&mut buf).await.ok()?;
+			    let variant = <$field as prost::Message>::decode(buf.as_slice()).ok()?;
+			    Some(Self::$variant(variant))
+			}
+		    ),*
+		}
+	    }
+
+	    async fn write_to<W: AsyncWrite + Unpin>(w: &mut W, m: $name) -> Option<()> {
+		use tokio::io::AsyncWriteExt;
+		use prost::Message;
+		
+		let tag = m.tag() as u16;
+		let mut buf = vec![];
+		match m {
+		    $(
+			Self::$variant(f) => {
+			    f.encode(&mut buf).ok()?
+			}
+		    ),*
+		}
+		w.write_all(&tag.to_be_bytes()).await.ok()?;
+		w.write_all(&(buf.len() as u32).to_be_bytes()).await.ok()?;
+		w.write_all(&buf).await.ok()?;
+		Some(())
+	    }
+	}
+    };
+}
+
+bind_message!{
+    enum Message {
+	Version(raw::Version) [PacketKind::Version],
+	UdpTunnel(raw::UdpTunnel) [PacketKind::UdpTunnel],
+	Authenticate(raw::Authenticate) [PacketKind::Authenticate],
+	Ping(raw::Ping) [PacketKind::Ping],
+	Reject(raw::Reject) [PacketKind::Reject],
+	ServerSync(raw::ServerSync) [PacketKind::ServerSync],
+	ChannelRemove(raw::ChannelRemove) [PacketKind::ChannelRemove],
+	ChannelState(raw::ChannelState) [PacketKind::ChannelState],
+	UserRemove(raw::UserRemove) [PacketKind::UserRemove],
+	UserState(raw::UserState) [PacketKind::UserState],
+	BanList(raw::BanList) [PacketKind::BanList],
+	TextMessage(raw::TextMessage) [PacketKind::TextMessage],
+	PermissionDenied(raw::PermissionDenied) [PacketKind::PermissionDenied],
+	Acl(raw::Acl) [PacketKind::Acl],
+	QueryUsers(raw::QueryUsers) [PacketKind::QueryUsers],
+	CryptSetup(raw::CryptSetup) [PacketKind::CryptSetup],
+	ContextActionModify(raw::ContextActionModify) [PacketKind::ContextActionModify],
+	ContextAction(raw::ContextAction) [PacketKind::ContextAction],
+	UserList(raw::UserList) [PacketKind::UserList],
+	VoiceTarget(raw::VoiceTarget) [PacketKind::VoiceTarget],
+	PermissionQuery(raw::PermissionQuery) [PacketKind::PermissionQuery],
+	CodecVersion(raw::CodecVersion) [PacketKind::CodecVersion],
+	UserStats(raw::UserStats) [PacketKind::UserStats],
+	RequestBlob(raw::RequestBlob) [PacketKind::RequestBlob],
+	ServerConfig(raw::ServerConfig) [PacketKind::ServerConfig],
+	SuggestConfig(raw::SuggestConfig) [PacketKind::SuggestConfig]
+    }
+}
+
+pub struct MumbleClient<H> {
+    control: ControlChannel<H>,
     voice: VoiceChannel,
 }
 
-struct ControlChannel {
+struct ControlChannel<H> {
     stream: TcpStream,
-    handler: Arc<dyn MessageHandler>
-}
-
-impl ControlChannel {
-    async fn receive(&mut self) -> Option<()> {
-	macro_rules! dispatch_message {
-	    ($tag:ident, $len:ident, $stream:ident, [$(($variant:pat, $p:ty, $func:path)),*]) => {{
-		use prost::Message;
-		
-		match $tag {
-		    $(
-			$variant => {
-			    let mut buf = vec![0u8; $len as usize];
-			    $stream.read_exact(&mut buf).await.ok()?;
-			    let p = <$p>::decode(buf.as_slice()).ok()?;
-			    $func(&*self.handler, p);
-			}
-		    )*,
-		    _ => unimplemented!()
-		}
-	    }};
-	}
-	
-	let stream = &mut self.stream;
-	loop {
-	    let tag = PacketKind::from_tag(stream.read_u16().await.ok()?)?;
-	    let len = stream.read_u32().await.ok()?;
-	    dispatch_message!(tag, len, stream, [
-		(PacketKind::Version, raw::Version, MessageHandler::version),
-		(PacketKind::UdpTunnel, raw::UdpTunnel, MessageHandler::udp_tunnel),
-		(PacketKind::Authenticate, raw::Authenticate, MessageHandler::authenticate),
-		(PacketKind::Ping, raw::Ping, MessageHandler::ping),
-		(PacketKind::Reject, raw::Reject, MessageHandler::reject),
-		(PacketKind::ServerSync, raw::ServerSync, MessageHandler::server_sync),
-		(PacketKind::ChannelRemove, raw::ChannelRemove, MessageHandler::channel_remove),
-		(PacketKind::UserRemove, raw::UserRemove, MessageHandler::user_remove),
-		(PacketKind::UserState, raw::UserState, MessageHandler::user_state),
-		(PacketKind::BanList, raw::BanList, MessageHandler::ban_list),
-		(PacketKind::TextMessage, raw::TextMessage, MessageHandler::text_message),
-		(PacketKind::PermissionDenied, raw::PermissionDenied, MessageHandler::permission_denied),
-		(PacketKind::Acl, raw::Acl, MessageHandler::acl),
-		(PacketKind::QueryUsers, raw::QueryUsers, MessageHandler::query_users),
-		(PacketKind::CryptSetup, raw::CryptSetup, MessageHandler::crypt_setup),
-		(PacketKind::ContextActionModify, raw::ContextActionModify, MessageHandler::context_action_modify),
-		(PacketKind::ContextAction, raw::ContextAction, MessageHandler::context_action),
-		(PacketKind::UserList, raw::UserList, MessageHandler::user_list),
-		(PacketKind::VoiceTarget, raw::VoiceTarget, MessageHandler::voice_target),
-		(PacketKind::PermissionQuery, raw::PermissionQuery, MessageHandler::permission_query),
-		(PacketKind::CodecVersion, raw::CodecVersion, MessageHandler::codec_version),
-		(PacketKind::UserStats, raw::UserStats, MessageHandler::user_stats),
-		(PacketKind::RequestBlob, raw::RequestBlob, MessageHandler::request_blob),
-		(PacketKind::ServerConfig, raw::ServerConfig, MessageHandler::server_config),
-		(PacketKind::SuggestConfig, raw::SuggestConfig, MessageHandler::suggest_config)
-	    ])
-	}
-    }
+    handler: H
 }
 
 struct VoiceChannel(UdpSocket);
 
-macro_rules! impl_fns {
-    ($($fn_name:ident : $msg:ty),*) => {
-	$(
-	    fn $fn_name(&self, _msg: $msg) {}
-	)*
-    };
-}
-
-
 #[async_trait::async_trait]
 trait MessageHandler {
-    impl_fns!{
-	version : raw::Version,
-	udp_tunnel : raw::UdpTunnel,
-	authenticate : raw::Authenticate,
-	ping : raw::Ping,
-	reject : raw::Reject,
-	server_sync : raw::ServerSync,
-	channel_remove : raw::ChannelRemove,
-	user_remove : raw::UserRemove,
-	user_state : raw::UserState,
-	ban_list : raw::BanList,
-	text_message : raw::TextMessage,
-	permission_denied : raw::PermissionDenied,
-	acl : raw::Acl,
-	query_users : raw::QueryUsers,
-	crypt_setup : raw::CryptSetup,
-	context_action_modify : raw::ContextActionModify,
-	context_action : raw::ContextAction,
-	user_list : raw::UserList,
-	voice_target : raw::VoiceTarget,
-	permission_query : raw::PermissionQuery,
-	codec_version : raw::CodecVersion,
-	user_stats : raw::UserStats,
-	request_blob : raw::RequestBlob,
-	server_config : raw::ServerConfig,
-	suggest_config : raw::SuggestConfig
-    }
+    async fn handle_message(m: Message);
 }
-
 
 #[repr(u16)]
 #[non_exhaustive]
