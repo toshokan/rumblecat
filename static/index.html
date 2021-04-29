@@ -1,0 +1,36 @@
+<html>
+  <meta charset=utf8>
+  <header>
+    <title>Test</title>
+  </header>
+  <body>
+    <h1>Test page</h1>
+    Name: <input id="name" type="text">
+    <br>
+    <button id="connect" type="button">Connect</button>
+    <script>
+      window.onload = () => {
+	  console.log("Hello world");
+	  const name = document.getElementById("name");
+	  const button = document.getElementById("connect");
+	  var ws = null;
+	  button.onclick = () => {
+	      if (ws) {
+		  ws.close();
+	      }
+	      ws = new WebSocket("ws://localhost:3030/rumble/" + name.value);
+	      ws.onopen = () => {
+		  console.log("WebSocket connected!");
+	      }
+	      ws.onmessage = (m) => {
+		  const js = JSON.parse(m.data);
+		  if (js.type === 'UdpTunnel') {
+		      const data = js.Audio.kind.Opus.data;
+		      console.log(data);
+		  }
+	      }
+	  }
+      }
+    </script>
+  </body>
+</html>

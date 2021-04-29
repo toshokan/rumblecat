@@ -12,6 +12,8 @@ mod raw;
 macro_rules! bind_message {
     (enum ($iname:ident, $oname:ident) {$($variant:ident ($field:ty) [$tag:path]),* | $($vvariant:ident ($vfield:ty, $vfield2:ty) [$vtag:path]),*}) => {
 	#[derive(Debug)]
+	#[derive(serde::Serialize, serde::Deserialize)]
+	#[serde(tag = "type")]
 	pub enum $iname {
 	    $(
 		$variant($field),
@@ -22,6 +24,8 @@ macro_rules! bind_message {
 	}
 
 	#[derive(Debug)]
+	#[derive(serde::Serialize, serde::Deserialize)]
+	#[serde(tag = "type")]
 	pub enum $oname {
 	    $(
 		$variant($field),
@@ -356,6 +360,7 @@ impl PacketKind {
 }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum VoicePacket<A> {
     Ping {
 	timestamp: u64,
@@ -509,6 +514,7 @@ async fn read_opus_payload<R: AsyncRead + Unpin>(r: &mut R) -> Option<AudioFrame
 // }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct IncomingAudioPacket {
     target: Target,
     kind: AudioPacketKind,
@@ -517,6 +523,7 @@ pub struct IncomingAudioPacket {
 }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct OutgoingAudioPacket {
     target: Target,
     kind: AudioPacketKind,
@@ -524,6 +531,7 @@ pub struct OutgoingAudioPacket {
 }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AudioPacketKind {
     CeltAlpha(Vec<AudioFrame>),
     CeltBeta(Vec<AudioFrame>),
@@ -532,12 +540,14 @@ pub enum AudioPacketKind {
 }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct AudioFrame {
     is_terminal: bool,
     data: Vec<u8>
 }
 
 #[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Target {
     Normal,
     Whisper(u8),
@@ -556,23 +566,24 @@ impl Target {
 }
 
 pub async fn serve(connector: MumbleConnector) -> Option<()> {
-    use warp::Filter;
+    use warp::{Filter, Reply};
 
     let connector = Arc::new(connector);
     
-    let routes = warp::path("rumble")
+    let ws_routes = {
+	let connector = Arc::clone(&connector);
+	warp::path("rumble")
         .and(warp::any().map(move || connector.clone()))
         .and(warp::path::param())
         .and(warp::ws())
         .map(|connector: Arc<MumbleConnector>, user: String, ws: warp::ws::Ws| {
-
-	    
 	    ws.on_upgrade(|socket| async move {
 		let (mut tx, mut rx) = socket.split();
-		let mut connection = connector.connect(&user).await.unwrap();		
+		let mut connection = connector.connect(&user).await.unwrap();
 		let _handle = tokio::task::spawn(async move {
 		    while let Some(msg) = connection.recv_message().await {
-			tx.send(warp::ws::Message::text(format!("got message {:?} from mumble", msg.tag()))).await.unwrap();
+			let json = serde_json::to_string_pretty(&msg).unwrap();
+			tx.send(warp::ws::Message::text(json)).await.unwrap();
 		    }
 		});
 		
@@ -580,7 +591,13 @@ pub async fn serve(connector: MumbleConnector) -> Option<()> {
 		    eprintln!("{:?}", x)
 		}
 	    })
-	});
+	})
+    };
+
+    let root_route = warp::path::end()
+        .and(warp::fs::dir("./static"));
+
+    let routes = root_route.or(ws_routes);
 
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
     Some(())
